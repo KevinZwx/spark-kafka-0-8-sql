@@ -150,7 +150,6 @@ class KafkaSourceSuite extends KafkaSourceTest {
       assert(ex.getMessage.toLowerCase.contains("not supported"))
     }
 
-    testUnsupportedConfig("kafka.group.id")
     testUnsupportedConfig("kafka.auto.offset.reset")
     testUnsupportedConfig("kafka.key.deserializer")
     testUnsupportedConfig("kafka.value.deserializer")

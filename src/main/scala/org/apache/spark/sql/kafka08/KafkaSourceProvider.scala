@@ -91,7 +91,7 @@ private[kafka08] class KafkaSourceProvider extends StreamSourceProvider
         // So that consumers does not commit offsets unnecessarily
         .set("auto.commit.enable", "false")
         .setIfUnset(ConsumerConfig.SOCKET_RECEIVE_BUFFER_CONFIG, "65536")
-        .set(ConsumerConfig.GROUP_ID_CONFIG, "")
+        .setIfUnset(ConsumerConfig.GROUP_ID_CONFIG, "")
         .set("zookeeper.connect", "")
         .build()
 
@@ -118,12 +118,6 @@ private[kafka08] class KafkaSourceProvider extends StreamSourceProvider
     }
 
     // Validate user-specified Kafka options
-    if (caseInsensitiveParams.contains(s"kafka.${ConsumerConfig.GROUP_ID_CONFIG}")) {
-      throw new IllegalArgumentException(
-        s"Kafka option '${ConsumerConfig.GROUP_ID_CONFIG}' is not supported as " +
-          s"user-specified consumer groups is not used to track offsets.")
-    }
-
     if (caseInsensitiveParams.contains(s"kafka.${ConsumerConfig.AUTO_OFFSET_RESET_CONFIG}")) {
       throw new IllegalArgumentException(
         s"""
