@@ -93,6 +93,8 @@ abstract class KafkaSourceTest extends StreamTest with SharedSQLContext {
 }
 
 class KafkaSourceSuite extends KafkaSourceTest {
+  private val BROKER_SERVER = "blackstonekf1.service.mogujie.org:9092," +
+    "blackstonekf2.service.mogujie.org:9092,blackstonekf3.service.mogujie.org:9092"
 
   test("fetch data from Kafka stream") {
     val topic = newTopic()
@@ -105,7 +107,9 @@ class KafkaSourceSuite extends KafkaSourceTest {
       .format("kafka")
       .option("kafka.bootstrap.servers", testUtils.brokerAddress)
       .option("startingoffset", "smallest")
+      .option("kafka.metadata.brokers.list", BROKER_SERVER)
       .option("topics", topic)
+      .option("kafka.group.id", "test_group")
 
     val kafka = reader.load()
       .selectExpr("CAST(key AS STRING)", "CAST(value AS STRING)")
@@ -117,25 +121,6 @@ class KafkaSourceSuite extends KafkaSourceTest {
       CheckAnswer(2, 3, 4),
       StopStream
     )
-  }
-
-  test("bad source options") {
-    def testBadOptions(options: (String, String)*)(expectedMsgs: String*): Unit = {
-      val ex = intercept[IllegalArgumentException] {
-        val reader = spark
-          .readStream
-          .format("kafka")
-        options.foreach { case (k, v) => reader.option(k, v) }
-        reader.load()
-      }
-      expectedMsgs.foreach { m =>
-        assert(ex.getMessage.toLowerCase.contains(m.toLowerCase))
-      }
-    }
-
-    // no metadata.broker.list or bootstrap.servers specified
-    testBadOptions()(
-      """option 'kafka.bootstrap.servers' or 'kafka.metadata.broker.list' must be specified""")
   }
 
   test("unsupported kafka configs") {

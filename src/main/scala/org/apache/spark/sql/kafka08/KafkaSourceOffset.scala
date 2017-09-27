@@ -61,6 +61,7 @@ object KafkaSourceOffset {
   def getPartitionOffsets(offset: Offset): Map[TopicAndPartition, LeaderOffset] = {
     offset match {
       case o: KafkaSourceOffset => o.partitionToOffsets
+      case so: SerializedOffset => KafkaSourceOffset(so).partitionToOffsets
       case _ =>
         throw new IllegalArgumentException(
           s"Invalid conversion from offset of ${offset.getClass} to KafkaSourceOffset")

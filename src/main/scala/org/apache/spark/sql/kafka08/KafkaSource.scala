@@ -42,24 +42,18 @@ private[kafka08] class KafkaSource(
     kafkaParams: Map[String, String],
     sourceOptions: Map[String, String],
     metadataPath: String,
-    startFromSmallestOffset: Boolean)
+    startingOffset: String)
   extends Source with Logging {
 
-  private val sc = sqlContext.sparkContext
-  private val kc = new KafkaCluster(kafkaParams)
-  private val topicPartitions = KafkaCluster.checkErrors(kc.getPartitions(topics))
-
-  private val maxOffsetFetchAttempts =
-    sourceOptions.getOrElse("fetchOffset.numRetries", "3").toInt
-
   private lazy val initialPartitionOffsets = {
+    // 读取checkpoint/source/sourceId
     val metadataLog = new HDFSMetadataLog[KafkaSourceOffset](sqlContext.sparkSession, metadataPath) {
         override def serialize(metadata: KafkaSourceOffset, out: OutputStream): Unit = {
           out.write(0) // A zero byte is written to support Spark 2.1.0 (SPARK-19517)
           val writer = new BufferedWriter(new OutputStreamWriter(out, StandardCharsets.UTF_8))
           writer.write("v" + KafkaSource.VERSION + "\n")
-          writer.write(metadata.json)
-          writer.flush
+          writer.write(metadata.json())
+          writer.flush()
         }
 
         override def deserialize(in: InputStream): KafkaSourceOffset = {
@@ -70,7 +64,6 @@ private[kafka08] class KafkaSource(
           if (content(0) == 'v') {
             val indexOfNewLine = content.indexOf("\n")
             if (indexOfNewLine > 0) {
-              val version = parseVersion(content.substring(0, indexOfNewLine), KafkaSource.VERSION)
               KafkaSourceOffset(SerializedOffset(content.substring(indexOfNewLine + 1)))
             } else {
               throw new IllegalStateException(
@@ -82,33 +75,69 @@ private[kafka08] class KafkaSource(
           }
         }
     }
+    // get(0)是因为sources目录下只保存一个batchId为0的文件，其中的内容为该source还未消费的最新的offset
+    // kafka010中这里就支持earliest、largest和range（自定义offset范围）
+//    metadataLog.get(0).getOrElse {
+//      val offsets = for {
+//        leaderOffsets <- (if (startFromSmallestOffset) {
+//          kc.getEarliestLeaderOffsets(topicPartitions)
+//        } else {
+//          kc.getLatestLeaderOffsets(topicPartitions)
+//        }).right
+//      } yield leaderOffsets
+//
+//      val kafkaSourceOffset = KafkaSourceOffset(KafkaCluster.checkErrors(offsets))
+//
+//      metadataLog.add(0, kafkaSourceOffset)
+//      info(s"Initial offsets: $kafkaSourceOffset")
+//      kafkaSourceOffset
+//    }.partitionToOffsets
+
+
+    val offsets = startingOffset match {
+      case "smallest" => kc.getEarliestLeaderOffsets(topicPartitions)
+      case "largest" =>  kc.getLatestLeaderOffsets(topicPartitions)
+      case pos =>
+        metadataLog.purge(1)
+        kc.getLeaderOffsets(topicPartitions, pos.toLong)
+    }
     metadataLog.get(0).getOrElse {
-      val offsets = for {
-        leaderOffsets <- (if (startFromSmallestOffset) {
-          kc.getEarliestLeaderOffsets(topicPartitions)
-        } else {
-          kc.getLatestLeaderOffsets(topicPartitions)
-        }).right
-      } yield leaderOffsets
-
       val kafkaSourceOffset = KafkaSourceOffset(KafkaCluster.checkErrors(offsets))
-
       metadataLog.add(0, kafkaSourceOffset)
       info(s"Initial offsets: $kafkaSourceOffset")
       kafkaSourceOffset
     }.partitionToOffsets
   }
+  private val sc = sqlContext.sparkContext
+  private val kc = new KafkaCluster(kafkaParams)
+  private val topicPartitions = KafkaCluster.checkErrors(kc.getPartitions(topics))
 
-  override def schema: StructType = KafkaSource.kafkaSchema
+  private val maxOffsetFetchAttempts =
+    sourceOptions.getOrElse("fetchOffset.numRetries", "3").toInt
+
+  private val maxOffsetsPerTrigger =
+    sourceOptions.get("maxOffsetsPerTrigger").map(_.toLong)
+
+  private var currentPartitionOffsets: Option[Map[TopicAndPartition, LeaderOffset]] = None
 
   /** Returns the maximum available offset for this source. */
   override def getOffset: Option[Offset] = {
     // Make sure initialPartitionOffsets is initialized
     initialPartitionOffsets
 
-    val offset = KafkaSourceOffset(fetchLatestOffsets(maxOffsetFetchAttempts))
-    debug(s"GetOffset: ${offset.partitionToOffsets.toSeq.map(_.toString).sorted}")
-    Some(offset)
+    val latest = fetchLatestOffsets(maxOffsetFetchAttempts)
+    val offset = maxOffsetsPerTrigger match {
+      case None =>
+        latest
+      case Some(limit) if currentPartitionOffsets.isEmpty =>
+        rateLimit(limit, initialPartitionOffsets, latest)
+      case Some(limit) =>
+        rateLimit(limit, currentPartitionOffsets.get, latest)
+    }
+    currentPartitionOffsets = Some(offset)
+    val kafkaOffset = KafkaSourceOffset(offset)
+    debug(s"GetOffset: ${kafkaOffset.partitionToOffsets.toSeq.map(_.toString).sorted}")
+    Some(kafkaOffset)
   }
 
   /**
@@ -123,6 +152,7 @@ private[kafka08] class KafkaSource(
     info(s"GetBatch called with start = $start, end = $end")
     val untilPartitionOffsets = KafkaSourceOffset.getPartitionOffsets(end)
     val fromPartitionOffsets = start match {
+      // 上一个batch的endOffset
       case Some(prevBatchEndOffset) =>
         KafkaSourceOffset.getPartitionOffsets(prevBatchEndOffset)
       case None =>
@@ -151,13 +181,59 @@ private[kafka08] class KafkaSource(
       Row](sc, kafkaParams, offsetRanges, leaders, messageHandler)
 
     info("GetBatch generating RDD of offset range: " + offsetRanges.sortBy(_.topic).mkString(","))
+
+    if (currentPartitionOffsets.isEmpty) {
+      currentPartitionOffsets = Some(untilPartitionOffsets)
+    }
+
     sqlContext.createDataFrame(rdd, schema)
   }
+
+  override def schema: StructType = KafkaSource.kafkaSchema
 
   /** Stop this source and free any resources it has allocated. */
   override def stop(): Unit = { }
 
-  override def toString(): String = s"KafkaSource for topics [${topics.mkString(",")}]"
+  override def toString: String = s"KafkaSource for topics [${topics.mkString(",")}]"
+
+  private def rateLimit(
+      limit: Long,
+      from: Map[TopicAndPartition, LeaderOffset],
+      until: Map[TopicAndPartition, LeaderOffset]): Map[TopicAndPartition, LeaderOffset] = {
+//    val newTopicPartitions = until.keySet.diff(from.keySet).toSet
+//    val fromNew = fetchEarliestOffsets(maxOffsetFetchAttempts)
+    println(s"-------------------limit rate-------------------")
+    val sizes = until.flatMap {
+    case (tp, end) =>
+        // If begin isn't defined, something's wrong, but let alert logic in getBatch handle it
+        from.get(tp).flatMap { begin =>
+          val size = end.offset - begin.offset
+          debug(s"rateLimit $tp size is $size")
+          if (size > 0) Some(tp -> size) else None
+        }
+    }
+
+    val total = sizes.values.sum.toDouble
+
+    if (total < 1) {
+      until
+    } else {
+      until.map {
+        case (tp, end) =>
+          tp -> sizes.get(tp).map { size =>
+            val begin = from(tp).offset
+            val prorate = limit * (size / total)
+            debug(s"rateLimit $tp prorated amount is $prorate")
+            // Don't completely starve small topicpartitions
+            val off = begin + (if (prorate < 1) Math.ceil(prorate) else Math.floor(prorate)).toLong
+            debug(s"rateLimit $tp new offset is $off")
+            // Paranoia, make sure not to return an offset that's past end
+            val realEnd = Math.min(end.offset, off)
+            LeaderOffset(end.host, end.port, realEnd)
+          }.getOrElse(end)
+      }
+    }
+  }
 
   /**
    * Fetch the latest offset of partitions.
@@ -178,12 +254,32 @@ private[kafka08] class KafkaSource(
       offsets.right.get
     }
   }
+
+  /**
+    * Fetch the earliest offset of partitions.
+    */
+  @tailrec
+  private def fetchEarliestOffsets(retries: Int): Map[TopicAndPartition, LeaderOffset] = {
+    val offsets = kc.getEarliestLeaderOffsets(topicPartitions)
+    if (offsets.isLeft) {
+      val err = offsets.left.get.toString
+      if (retries <= 0) {
+        throw new SparkException(err)
+      } else {
+        error(err)
+        Thread.sleep(kc.config.refreshLeaderBackoffMs)
+        fetchEarliestOffsets(retries - 1)
+      }
+    } else {
+      offsets.right.get
+    }
+  }
 }
 
 /** Companion object for the [[KafkaSource]]. */
 private[kafka08] object KafkaSource {
 
-  private[kafka08] val VERSION = 0
+  private[kafka08] val VERSION = 1
 
   def kafkaSchema: StructType = StructType(Seq(
     StructField("key", BinaryType),

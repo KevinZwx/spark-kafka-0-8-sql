@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.kafka08
 
+import java.text.{ParseException, SimpleDateFormat}
 import java.{util => ju}
 
 import scala.collection.JavaConverters._
@@ -72,14 +73,16 @@ private[kafka08] class KafkaSourceProvider extends StreamSourceProvider
         case None => throw new IllegalArgumentException(s"$TOPICS should be set.")
       }
 
-    val startFromEarliestOffset =
+    val startingOffset =
       caseInsensitiveParams.get(STARTING_OFFSET_OPTION_KEY).map(_.trim.toLowerCase) match {
-        case Some("largest") => false
-        case Some("smallest") => true
-        case Some(pos) =>
-          // This should not happen since we have already checked the options.
-          throw new IllegalStateException(s"Invalid $STARTING_OFFSET_OPTION_KEY: $pos")
-        case None => false
+        case Some("smallest") => "smallest"
+        case Some("largest") =>  "largest"
+        case Some(pos: String) => date_to_timeStamp(pos)
+        case _ => {
+          println(s"Invalid starting offset, only support ${STARTING_OFFSET_OPTION_VALUES.mkString(", ")}")
+          println(s"Read from largest offset.")
+          "largest"
+        }
       }
 
     val kafkaParams =
@@ -92,7 +95,7 @@ private[kafka08] class KafkaSourceProvider extends StreamSourceProvider
         .set("auto.commit.enable", "false")
         .setIfUnset(ConsumerConfig.SOCKET_RECEIVE_BUFFER_CONFIG, "65536")
         .setIfUnset(ConsumerConfig.GROUP_ID_CONFIG, "")
-        .set("zookeeper.connect", "")
+        .setIfUnset("zookeeper.connect", "")
         .build()
 
     new KafkaSource(
@@ -101,7 +104,21 @@ private[kafka08] class KafkaSourceProvider extends StreamSourceProvider
       kafkaParams.asScala.toMap,
       parameters,
       metadataPath,
-      startFromEarliestOffset)
+      startingOffset)
+  }
+
+  def date_to_timeStamp(date: String): String = {
+    val sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+    try {
+      sdf.parse(date).getTime.toString
+    } catch {
+      case pe: ParseException => {
+        println(pe.getMessage)
+        logger.warn(pe.getMessage)
+        logger.warn("Input date format incorrect, read from largest offset.")
+        "largest"
+      }
+    }
   }
 
   private def validateOptions(parameters: Map[String, String]): Unit = {
@@ -109,15 +126,28 @@ private[kafka08] class KafkaSourceProvider extends StreamSourceProvider
     // Validate source options
     val caseInsensitiveParams = parameters.map { case (k, v) => (k.toLowerCase, v) }
 
-    caseInsensitiveParams.get(STARTING_OFFSET_OPTION_KEY) match {
-      case Some(pos) if !STARTING_OFFSET_OPTION_VALUES.contains(pos.trim.toLowerCase) =>
-        throw new IllegalArgumentException(
-          s"Illegal value '$pos' for option '$STARTING_OFFSET_OPTION_KEY', " +
-            s"acceptable values are: ${STARTING_OFFSET_OPTION_VALUES.mkString(", ")}")
-      case _ =>
-    }
+//    caseInsensitiveParams.get(STARTING_OFFSET_OPTION_KEY) match {
+//      case Some(pos) if !STARTING_OFFSET_OPTION_VALUES.contains(pos.trim.toLowerCase) =>
+//        throw new IllegalArgumentException(
+//          s"Illegal value '$pos' for option '$STARTING_OFFSET_OPTION_KEY', " +
+//            s"acceptable values are: ${STARTING_OFFSET_OPTION_VALUES.mkString(", ")}")
+//      case _ =>
+//    }
 
     // Validate user-specified Kafka options
+    if (caseInsensitiveParams.contains(s"kafka.${ConsumerConfig.GROUP_ID_CONFIG}")) {
+      if ("".equals(caseInsensitiveParams.get(s"kafka.${ConsumerConfig.GROUP_ID_CONFIG}").toString)){
+        throw new IllegalArgumentException(
+          s"""
+             |kafka.group.id cannot be set to "".
+         """.stripMargin)
+      }
+//      else {
+//        println(caseInsensitiveParams.get(s"kafka.${ConsumerConfig.GROUP_ID_CONFIG}"))
+//      }
+    }
+
+
     if (caseInsensitiveParams.contains(s"kafka.${ConsumerConfig.AUTO_OFFSET_RESET_CONFIG}")) {
       throw new IllegalArgumentException(
         s"""
@@ -148,9 +178,7 @@ private[kafka08] class KafkaSourceProvider extends StreamSourceProvider
           + "operations to explicitly deserialize the values.")
     }
 
-    val otherUnsupportedConfigs = Seq(
-      "auto.commit.enable", // committing correctly requires new APIs in Source
-      "zookeeper.connect")
+    val otherUnsupportedConfigs = Seq("auto.commit.enable") // committing correctly requires new APIs in Source
 
     otherUnsupportedConfigs.foreach { c =>
       if (caseInsensitiveParams.contains(s"kafka.$c")) {
@@ -159,7 +187,7 @@ private[kafka08] class KafkaSourceProvider extends StreamSourceProvider
     }
 
     if (!caseInsensitiveParams.contains(s"kafka.${ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG}") &&
-      !caseInsensitiveParams.contains(s"kafka.metadata.brokers.list")) {
+      !caseInsensitiveParams.contains(s"kafka.metadata.broker.list")) {
       throw new IllegalArgumentException(
         s"Option 'kafka.${ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG}' or " +
           "'kafka.metadata.broker.list' must be specified for configuring Kafka consumer")
@@ -187,12 +215,13 @@ private[kafka08] class KafkaSourceProvider extends StreamSourceProvider
     }
 
     def build(): ju.Map[String, String] = map
+
   }
 }
 
 private[kafka08] object KafkaSourceProvider {
   private val TOPICS = "topics"
   private val STARTING_OFFSET_OPTION_KEY = "startingoffset"
-  private val STARTING_OFFSET_OPTION_VALUES = Set("largest", "smallest")
+  private val STARTING_OFFSET_OPTION_VALUES = Set("largest", "smallest", "date of format: YY-MM-DD HH-MM-SS")
 }
 

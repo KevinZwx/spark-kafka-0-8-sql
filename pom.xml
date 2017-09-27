@@ -5,7 +5,7 @@
   <modelVersion>4.0.0</modelVersion>
 
   <groupId>org.apache.spark</groupId>
-  <artifactId>spark-kafka-0-8-sql_2.11</artifactId>
+  <artifactId>spark-sql-kafka-0-8_2.11-2.2.0</artifactId>
   <version>1.0</version>
 
   <properties>
